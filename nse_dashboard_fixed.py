@@ -194,6 +194,207 @@ def detect_rs_new_high(close_series, bench_series):
 
 
 # ─────────────────────────────────────────────────────────────────
+# RRG  –  Relative Rotation Graph helpers
+# ─────────────────────────────────────────────────────────────────
+
+def compute_rrg(industry_price_dict, bench_series, tail=10):
+    """
+    JdK RS-Ratio / RS-Momentum methodology.
+
+    For each industry:
+      1.  price_relative  = industry_index / benchmark  (normalised)
+      2.  RS-Ratio        = 100 × EMA10(PR) / EMA26(PR)
+      3.  RS-Momentum     = 100 × EMA10(RS-Ratio) / EMA26(RS-Ratio)
+
+    Returns a list of dicts, one per industry, with the last value and
+    a `tail` of (ratio, momentum) pairs for the rotation trail.
+    """
+    rows = []
+    for industry, pr_series in industry_price_dict.items():
+        aligned = pd.concat([pr_series, bench_series], axis=1).dropna()
+        if len(aligned) < 60:
+            continue
+        aligned.columns = ["ind", "bench"]
+
+        # Price relative (normalised so first value = 100)
+        pr = (aligned["ind"] / aligned["bench"])
+        pr = pr / pr.iloc[0] * 100
+
+        # RS-Ratio & RS-Momentum
+        ema10 = pr.ewm(span=10, adjust=False).mean()
+        ema26 = pr.ewm(span=26, adjust=False).mean()
+        rs_ratio = 100 * (ema10 / ema26)
+
+        mom_ema10 = rs_ratio.ewm(span=10, adjust=False).mean()
+        mom_ema26 = rs_ratio.ewm(span=26, adjust=False).mean()
+        rs_mom    = 100 * (mom_ema10 / mom_ema26)
+
+        # Tail (last N periods including current)
+        tail_ratio = rs_ratio.iloc[-tail:].tolist()
+        tail_mom   = rs_mom.iloc[-tail:].tolist()
+
+        def quadrant(r, m):
+            if r >= 100 and m >= 100: return "Leading"
+            if r >= 100 and m <  100: return "Weakening"
+            if r <  100 and m <  100: return "Lagging"
+            return "Improving"
+
+        rows.append({
+            "Industry":     industry,
+            "RS_Ratio":     round(rs_ratio.iloc[-1], 4),
+            "RS_Momentum":  round(rs_mom.iloc[-1],   4),
+            "Quadrant":     quadrant(rs_ratio.iloc[-1], rs_mom.iloc[-1]),
+            "tail_ratio":   tail_ratio,
+            "tail_mom":     tail_mom,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_rrg_chart(rrg_df, mode="Industry"):
+    """
+    Scatter plot with:
+      • Coloured quadrant backgrounds
+      • Centre cross-hair at (100, 100)
+      • Tail arrows per industry
+      • Dot + label at current position
+    """
+    QUAD_COLORS = {
+        "Leading":   "rgba(38,166,154,0.12)",
+        "Weakening": "rgba(255,193,7,0.12)",
+        "Lagging":   "rgba(239,83,80,0.12)",
+        "Improving": "rgba(100,181,246,0.12)",
+    }
+    DOT_COLORS = {
+        "Leading":   "#26A69A",
+        "Weakening": "#FFC107",
+        "Lagging":   "#EF5350",
+        "Improving": "#64B5F6",
+    }
+
+    fig = go.Figure()
+
+    # Axis range — pad 0.5 % around data
+    all_r = [v for row in rrg_df.itertuples() for v in row.tail_ratio]
+    all_m = [v for row in rrg_df.itertuples() for v in row.tail_mom]
+    pad   = 0.3
+    x_min = min(all_r) - pad;  x_max = max(all_r) + pad
+    y_min = min(all_m) - pad;  y_max = max(all_m) + pad
+    # Always include the centre cross
+    x_min = min(x_min, 99.5);  x_max = max(x_max, 100.5)
+    y_min = min(y_min, 99.5);  y_max = max(y_max, 100.5)
+
+    # ── Quadrant rectangles ───────────────────────────────────────
+    quad_shapes = [
+        dict(type="rect", xref="x", yref="y",
+             x0=100, x1=x_max, y0=100, y1=y_max,
+             fillcolor=QUAD_COLORS["Leading"],   line_width=0, layer="below"),
+        dict(type="rect", xref="x", yref="y",
+             x0=100, x1=x_max, y0=y_min, y1=100,
+             fillcolor=QUAD_COLORS["Weakening"], line_width=0, layer="below"),
+        dict(type="rect", xref="x", yref="y",
+             x0=x_min, x1=100, y0=y_min, y1=100,
+             fillcolor=QUAD_COLORS["Lagging"],   line_width=0, layer="below"),
+        dict(type="rect", xref="x", yref="y",
+             x0=x_min, x1=100, y0=100, y1=y_max,
+             fillcolor=QUAD_COLORS["Improving"], line_width=0, layer="below"),
+    ]
+
+    # ── Quadrant labels ───────────────────────────────────────────
+    quad_annotations = [
+        dict(x=x_max-0.05, y=y_max-0.05, xref="x", yref="y",
+             text="<b>Leading</b>",  showarrow=False,
+             font=dict(color="#26A69A", size=13), xanchor="right", yanchor="top"),
+        dict(x=x_max-0.05, y=y_min+0.05, xref="x", yref="y",
+             text="<b>Weakening</b>", showarrow=False,
+             font=dict(color="#FFC107", size=13), xanchor="right", yanchor="bottom"),
+        dict(x=x_min+0.05, y=y_min+0.05, xref="x", yref="y",
+             text="<b>Lagging</b>",  showarrow=False,
+             font=dict(color="#EF5350", size=13), xanchor="left", yanchor="bottom"),
+        dict(x=x_min+0.05, y=y_max-0.05, xref="x", yref="y",
+             text="<b>Improving</b>", showarrow=False,
+             font=dict(color="#64B5F6", size=13), xanchor="left", yanchor="top"),
+    ]
+
+    # ── Per-industry traces ───────────────────────────────────────
+    for _, row in rrg_df.iterrows():
+        color = DOT_COLORS[row["Quadrant"]]
+        tr    = row["tail_ratio"]
+        tm    = row["tail_mom"]
+
+        # Tail line (faded)
+        fig.add_trace(go.Scatter(
+            x=tr, y=tm,
+            mode="lines",
+            line=dict(color=color, width=1.2, dash="dot"),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+        # Arrow from second-last → last point
+        if len(tr) >= 2:
+            fig.add_annotation(
+                ax=tr[-2], ay=tm[-2],
+                x=tr[-1],  y=tm[-1],
+                xref="x", yref="y", axref="x", ayref="y",
+                showarrow=True,
+                arrowhead=3, arrowsize=1.2,
+                arrowwidth=1.8, arrowcolor=color,
+            )
+
+        # Current dot
+        fig.add_trace(go.Scatter(
+            x=[tr[-1]], y=[tm[-1]],
+            mode="markers+text",
+            marker=dict(size=11, color=color,
+                        line=dict(color="white", width=1.2)),
+            text=[row["Industry"]],
+            textposition="top center",
+            textfont=dict(color="white", size=10),
+            name=row["Industry"],
+            customdata=[[row["Quadrant"], round(row["RS_Ratio"],4), round(row["RS_Momentum"],4)]],
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "Quadrant : %{customdata[0]}<br>"
+                "RS-Ratio : %{customdata[1]}<br>"
+                "RS-Mom   : %{customdata[2]}<extra></extra>"
+            ),
+        ))
+
+    # ── Centre cross-hair ─────────────────────────────────────────
+    centre_lines = [
+        dict(type="line", xref="x", yref="y",
+             x0=100, x1=100, y0=y_min, y1=y_max,
+             line=dict(color="rgba(255,255,255,0.35)", width=1, dash="dash")),
+        dict(type="line", xref="x", yref="y",
+             x0=x_min, x1=x_max, y0=100, y1=100,
+             line=dict(color="rgba(255,255,255,0.35)", width=1, dash="dash")),
+    ]
+
+    fig.update_layout(
+        height=680,
+        template="plotly_dark",
+        paper_bgcolor="#0E1117",
+        plot_bgcolor="#0E1117",
+        title=dict(
+            text=f"<b>Relative Rotation Graph — {mode}</b>   "
+                 "<span style='font-size:12px;color:#aaa'>"
+                 "(tail = last 10 trading days)</span>",
+            font=dict(size=16, color="white"),
+        ),
+        xaxis=dict(title="← Lagging  |  RS-Ratio  |  Leading →",
+                   range=[x_min, x_max], showgrid=False, zeroline=False),
+        yaxis=dict(title="↑ Momentum  |  RS-Momentum  |  ↓",
+                   range=[y_min, y_max], showgrid=False, zeroline=False),
+        showlegend=False,
+        hovermode="closest",
+        shapes=quad_shapes + centre_lines,
+        annotations=quad_annotations,
+        margin=dict(l=60, r=30, t=70, b=50),
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────
 # BENCHMARK CLOSE  (extract from multi-level download)
 # ─────────────────────────────────────────────────────────────────
 try:
@@ -284,6 +485,58 @@ sector_table = df_main.groupby("Sector").agg({
     "Momentum": "mean",
     "RSI":      "mean",
 }).reset_index()
+
+# ─────────────────────────────────────────────────────────────────
+# RRG  –  Build per-industry price index then compute RRG values
+# ─────────────────────────────────────────────────────────────────
+
+# Map every industry to the list of its symbols
+industry_symbols: dict = {}
+for sym, (sec, ind) in stocks.items():
+    industry_symbols.setdefault(ind, []).append(sym)
+
+# Build an equal-weight normalised price index per industry
+industry_price_dict: dict = {}
+for ind, syms in industry_symbols.items():
+    series_list = []
+    for sym in syms:
+        try:
+            s = data[sym]["Close"].dropna()
+            if len(s) > 30:
+                series_list.append(s / s.iloc[0] * 100)   # normalise to 100
+        except Exception:
+            pass
+    if series_list:
+        combined = pd.concat(series_list, axis=1).mean(axis=1)
+        industry_price_dict[ind] = combined
+
+# Compute RRG dataframe (industry-level)
+rrg_industry_df = pd.DataFrame()
+if benchmark_close is not None and industry_price_dict:
+    rrg_industry_df = compute_rrg(industry_price_dict, benchmark_close, tail=10)
+
+# Also compute sector-level RRG
+sector_symbols: dict = {}
+for sym, (sec, ind) in stocks.items():
+    sector_symbols.setdefault(sec, []).append(sym)
+
+sector_price_dict: dict = {}
+for sec, syms in sector_symbols.items():
+    series_list = []
+    for sym in syms:
+        try:
+            s = data[sym]["Close"].dropna()
+            if len(s) > 30:
+                series_list.append(s / s.iloc[0] * 100)
+        except Exception:
+            pass
+    if series_list:
+        sector_price_dict[sec] = pd.concat(series_list, axis=1).mean(axis=1)
+
+rrg_sector_df = pd.DataFrame()
+if benchmark_close is not None and sector_price_dict:
+    rrg_sector_df = compute_rrg(sector_price_dict, benchmark_close, tail=10)
+    rrg_sector_df = rrg_sector_df.rename(columns={"Industry": "Sector"})
 
 # ─────────────────────────────────────────────────────────────────
 # SIDEBAR – FILTERS
@@ -441,7 +694,52 @@ with col2:
     )
     st.plotly_chart(fig_sm, use_container_width=True)
 
-# ── 2. Heatmap ───────────────────────────────────────────────────
+# ── 2. RRG Chart ─────────────────────────────────────────────────
+st.subheader("🔄 Relative Rotation Graph (RRG)")
+
+rrg_tab1, rrg_tab2 = st.tabs(["By Industry", "By Sector"])
+
+with rrg_tab1:
+    if not rrg_industry_df.empty:
+        fig_rrg_ind = build_rrg_chart(rrg_industry_df, mode="Industry")
+        st.plotly_chart(fig_rrg_ind, use_container_width=True)
+
+        # Summary table below chart
+        rrg_display = rrg_industry_df[["Industry","Quadrant","RS_Ratio","RS_Momentum"]].copy()
+        rrg_display = rrg_display.sort_values("Quadrant")
+        quad_icon   = {"Leading":"🟢","Weakening":"🟡","Lagging":"🔴","Improving":"🔵"}
+        rrg_display["Quadrant"] = rrg_display["Quadrant"].map(
+            lambda q: f"{quad_icon.get(q,'')} {q}"
+        )
+        st.dataframe(rrg_display, use_container_width=True, hide_index=True)
+    else:
+        st.info("RRG data unavailable (benchmark data missing).")
+
+with rrg_tab2:
+    if not rrg_sector_df.empty:
+        fig_rrg_sec = build_rrg_chart(
+            rrg_sector_df.rename(columns={"Sector": "Industry"}), mode="Sector"
+        )
+        st.plotly_chart(fig_rrg_sec, use_container_width=True)
+
+        rrg_sec_display = rrg_sector_df[["Sector","Quadrant","RS_Ratio","RS_Momentum"]].copy()
+        rrg_sec_display = rrg_sec_display.sort_values("Quadrant")
+        rrg_sec_display["Quadrant"] = rrg_sec_display["Quadrant"].map(
+            lambda q: f"{quad_icon.get(q,'')} {q}"
+        )
+        st.dataframe(rrg_sec_display, use_container_width=True, hide_index=True)
+    else:
+        st.info("RRG data unavailable (benchmark data missing).")
+
+rc1, rc2, rc3, rc4 = st.columns(4)
+rc1.success("🟢 **Leading** — Strong RS, rising momentum")
+rc2.warning("🟡 **Weakening** — Strong RS, fading momentum")
+rc3.error("🔴 **Lagging** — Weak RS, falling momentum")
+rc4.info("🔵 **Improving** — Weak RS, but momentum turning up")
+
+st.divider()
+
+# ── 3. Heatmap ───────────────────────────────────────────────────
 st.subheader("Market Heatmap")
 heat = px.treemap(
     df_main,
@@ -454,7 +752,7 @@ heat = px.treemap(
 )
 st.plotly_chart(heat, use_container_width=True)
 
-# ── 3. Market Breadth ────────────────────────────────────────────
+# ── 4. Market Breadth ────────────────────────────────────────────
 st.subheader("Market Breadth")
 breadth20 = (df_main["Above20DMA"].sum() / len(df_main)) * 100
 breadth50 = (df_main["Above50DMA"].sum() / len(df_main)) * 100
@@ -469,7 +767,7 @@ b4.metric("RS New High (Before Price)", rs_count)
 
 st.divider()
 
-# ── 4. Candlestick Chart ─────────────────────────────────────────
+# ── 5. Candlestick Chart ─────────────────────────────────────────
 st.subheader("📈 Candlestick Chart with EMA / Pocket Pivot / RS Line")
 
 chart_col1, chart_col2 = st.columns([2, 1])
@@ -500,7 +798,7 @@ if chart_sym and chart_sym in stock_dfs:
 
 st.divider()
 
-# ── 5. NR7 Scanner ───────────────────────────────────────────────
+# ── 6. NR7 Scanner ───────────────────────────────────────────────
 st.subheader("NR7 — Volatility Contraction")
 nr7_table = df_main[df_main["NR7"]]
 if nr7_table.empty:
@@ -508,7 +806,7 @@ if nr7_table.empty:
 else:
     st.dataframe(nr7_table, use_container_width=True)
 
-# ── 6. Pocket Pivot Scanner ──────────────────────────────────────
+# ── 7. Pocket Pivot Scanner ──────────────────────────────────────
 st.subheader("🟢 Pocket Pivot Scanner")
 pp_table = df_main[df_main["PocketPivot"]].sort_values("Momentum", ascending=False)
 if pp_table.empty:
@@ -516,7 +814,7 @@ if pp_table.empty:
 else:
     st.dataframe(pp_table, use_container_width=True)
 
-# ── 7. RS New High Scanner ───────────────────────────────────────
+# ── 8. RS New High Scanner ───────────────────────────────────────
 st.subheader("⭐ RS New High Before Price High")
 st.caption(
     "These stocks show **relative strength** vs Nifty 50 at a new high "
@@ -528,7 +826,7 @@ if rs_table.empty:
 else:
     st.dataframe(rs_table, use_container_width=True)
 
-# ── 8. Top Momentum ──────────────────────────────────────────────
+# ── 9. Top Momentum ──────────────────────────────────────────────
 st.subheader("Top Momentum Stocks")
 leaders = df_main.sort_values("Momentum", ascending=False).head(10)
 fig_mom = px.bar(
@@ -538,7 +836,7 @@ fig_mom = px.bar(
 )
 st.plotly_chart(fig_mom, use_container_width=True)
 
-# ── 9. Full Screener ─────────────────────────────────────────────
+# ── 10. Full Screener ─────────────────────────────────────────────
 st.subheader("📋 Stock Screener")
 
 # Emoji flags for boolean columns
